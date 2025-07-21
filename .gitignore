@@ -4,3 +4,4 @@ analysis_output/
 results/
 *.png
 *.mmd 
+.env 
