@@ -69,7 +69,7 @@ This will create:
 Run the combined analysis script:
 
 ```bash
-python combined_analysis.py
+cd /Users/nossaibakheiri/Downloads/lime && export LOCAL_CONTENT_DIR="/Users/nossaibakheiri/Downloads/Fourth Set (Summer 2025)" && python automate_lime_analysis_drive.py
 ```
 
 This will:
