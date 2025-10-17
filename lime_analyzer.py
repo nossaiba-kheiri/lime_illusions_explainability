@@ -4,12 +4,15 @@ from PIL import Image
 import torchvision.transforms as transforms
 from lime import lime_image
 from lime.wrappers.scikit_image import SegmentationAlgorithm
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend for threading compatibility
 import matplotlib.pyplot as plt
 import json
 import os
 from pathlib import Path
-import openai
-from typing import List, Dict, Any
+from openai import OpenAI # Import the new OpenAI client
+import httpx # Import httpx
+from typing import List, Dict, Any, Optional
 import base64
 from io import BytesIO
 from dotenv import load_dotenv
@@ -17,7 +20,17 @@ from skimage.segmentation import mark_boundaries
 from sentence_transformers import SentenceTransformer, util
 
 class LIMEAnalyzer:
-    def __init__(self, model_name: str = "gpt-4o", mode: str = "auto"):
+    def __init__(
+        self,
+        mode: str = "auto",
+        model_name: str = "gpt-4o",
+        api_key: Optional[str] = None,
+        verbose: bool = True,
+        sim_model_name_or_path: str = "all-MiniLM-L6-v2",
+        sim_model_local_dir: Optional[str] = None,
+        hf_offline: Optional[bool] = None,
+        shared_sim_model: Optional[Any] = None,  # Accept pre-loaded model
+    ):
         """
         Initialize the LIME analyzer for visual illusions.
         
@@ -33,11 +46,16 @@ class LIMEAnalyzer:
         if not api_key and mode == "auto":
             raise ValueError("OPENAI_API_KEY environment variable is not set")
         
-        self.model_name = model_name
         self.mode = mode
-        # Set OpenAI API key
+        self.model_name = model_name
+        self.verbose = verbose
+        self.openai_client = None # Will be initialized if mode is 'auto'
+
+        # Set OpenAI API key and initialize client
         if mode == "auto":
-            openai.api_key = api_key
+            # Create an httpx client without proxies to prevent TypeError if environment proxies are detected.
+            custom_httpx_client = httpx.Client()
+            self.openai_client = OpenAI(api_key=api_key, http_client=custom_httpx_client)
         
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -58,7 +76,66 @@ class LIMEAnalyzer:
             ratio=0.2         # Balance between color and space distances
         )
 
-        self.sim_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Configure semantic similarity model (with offline/local fallback)
+        if sim_model_local_dir is None:
+            sim_model_local_dir = os.getenv("SIM_MODEL_LOCAL_DIR")
+        if hf_offline is None:
+            hf_offline = os.getenv("HF_OFFLINE", "").lower() in ("1", "true", "yes")
+
+        self.sim_model = None
+        last_error: Optional[Exception] = None
+
+        # Use shared model if provided
+        if shared_sim_model is not None:
+            print(f"[INFO] Using shared sentence-transformers model")
+            self.sim_model = shared_sim_model
+        else:
+            # Attempt to load from local directory first
+            if sim_model_local_dir:
+                local_path = Path(sim_model_local_dir)
+                if local_path.is_dir():
+                    print(f"[DEBUG] hf_offline status before local load attempt: {hf_offline}")
+                    try:
+                        print(f"[INFO] Attempting to load sentence-transformers model from local directory: {local_path}")
+                        self.sim_model = SentenceTransformer(str(local_path), local_files_only=True)
+                    except Exception as e:
+                        last_error = e
+                        self.sim_model = None
+                        print(f"[ERROR] Failed to load local sentence-transformers model from {local_path}: {e}")
+                else:
+                    last_error = FileNotFoundError(f"SIM_MODEL_LOCAL_DIR points to a non-existent directory: {local_path}")
+
+            # If local load failed or was not specified, and not in offline mode, try loading online
+            if self.sim_model is None and not hf_offline:
+                print(f"[DEBUG] hf_offline status before online load attempt: {hf_offline}")
+                try:
+                    print(f"[INFO] Attempting to load sentence-transformers model online: {sim_model_name_or_path}")
+                    self.sim_model = SentenceTransformer(sim_model_name_or_path)
+                except Exception as e:
+                    last_error = e
+                    self.sim_model = None
+                    print(f"[ERROR] Failed to load online sentence-transformers model {sim_model_name_or_path}: {e}")
+
+            # If still not available, raise a clear error with guidance
+            if self.sim_model is None:
+                hint = (
+                    "Failed to load sentence-transformers model. "
+                    "Ensure SIM_MODEL_LOCAL_DIR is correctly set if you downloaded it, or check internet connectivity. "
+                    "Example to pre-download while online:\n"
+                    "  python -c \"from sentence_transformers import SentenceTransformer; "
+                    "SentenceTransformer('all-MiniLM-L6-v2').save('models/all-MiniLM-L6-v2')\"\n"
+                    "Then run with SIM_MODEL_LOCAL_DIR=models/all-MiniLM-L6-v2."
+                )
+                raise RuntimeError(hint) from last_error
+
+        # Move sentence transformer model to device
+        # Explicitly set to CPU to avoid persistent 'meta tensor' errors on some setups.
+        self.device = torch.device('cpu') # Force CPU for stability
+        print(f"[INFO] Forcing sentence-transformers model to use CPU for stability.")
+        self.sim_model = self.sim_model.to(self.device)
+        print(f"[INFO] Moved sentence-transformers model to {self.device}")
+        
+        self.llm_responses_for_lime = [] # To store LLM responses during LIME runs
 
     def _encode_image(self, image: np.ndarray) -> str:
         """
@@ -97,7 +174,7 @@ class LIMEAnalyzer:
         4. What elements make this an effective illusion?
         
         Provide a detailed analysis for each section."""
-        response = openai.ChatCompletion.create(
+        response = self.openai_client.chat.completions.create(
             model=self.model_name,
             messages=[
                 {
@@ -107,7 +184,8 @@ class LIMEAnalyzer:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{base64_image}"
+                                "url": f"data:image/png;base64,{base64_image}",
+                                "detail": "low" # Specify detail level if needed
                             }
                         }
                     ]
@@ -142,6 +220,8 @@ class LIMEAnalyzer:
                 llm_response = self._get_llm_prediction(image)
                 similarity = self._semantic_similarity(self.current_prompt, llm_response)
                 predictions.append([similarity])
+                # Store LLM response for potential later use
+                self.llm_responses_for_lime.append(llm_response)
         return np.array(predictions)
 
     def _create_perturbation_examples(self, image: np.ndarray, num_samples: int = 5) -> List[np.ndarray]:
@@ -214,8 +294,8 @@ class LIMEAnalyzer:
             plt.show()
 
     def _semantic_similarity(self, text1, text2):
-        emb1 = self.sim_model.encode(text1, convert_to_tensor=True)
-        emb2 = self.sim_model.encode(text2, convert_to_tensor=True)
+        emb1 = self.sim_model.encode(text1, convert_to_tensor=True, device=self.device)
+        emb2 = self.sim_model.encode(text2, convert_to_tensor=True, device=self.device)
         return float(util.pytorch_cos_sim(emb1, emb2).item())
 
     def analyze_image(self, image_path: str, prompt: str, num_samples: int = 3, top_labels: int = 3) -> Dict[str, Any]:
@@ -240,6 +320,9 @@ class LIMEAnalyzer:
         # Get initial LLM analysis
         initial_llm_response = self._get_llm_prediction(image_np)
         
+        # Clear previous LLM responses before starting new LIME explanation
+        self.llm_responses_for_lime = []
+
         # Generate LIME explanation
         explanation = self.explainer.explain_instance(
             image_np,
@@ -248,6 +331,11 @@ class LIMEAnalyzer:
             num_samples=num_samples,
             segmentation_fn=self.segmenter  # Uses quickshift algorithm for segmentation
         )
+        
+        # Retrieve all LLM responses that were stored during the LIME explanation process
+        all_llm_perturbed_responses = list(self.llm_responses_for_lime)
+        # Clear the list for the next run
+        self.llm_responses_for_lime = []
         
         # Get importance map
         importance_map = explanation.get_image_and_mask(
@@ -265,6 +353,7 @@ class LIMEAnalyzer:
         
         return {
             'original_image': image_np,
+            'prompt': prompt, # Added for visualization
             'importance_map': importance_map[0],  # The original image
             'mask': importance_map[1],           # The importance mask
             'explanation': explanation,
@@ -272,7 +361,8 @@ class LIMEAnalyzer:
             'top_regions': self._get_top_regions(explanation),
             'llm_analysis': {
                 'initial_llm_response': initial_llm_response,
-                'important_regions': important_regions
+                'important_regions': important_regions,
+                'perturbed_image_llm_responses': all_llm_perturbed_responses
             }
         }
 
@@ -549,25 +639,30 @@ class LIMEAnalyzer:
             results: Analysis results from analyze_image
             save_path: Optional path to save the visualization
         """
-        plt.figure(figsize=(15, 5))
+        plt.figure(figsize=(15, 7))
+        plt.subplots_adjust(bottom=0.2) # Adjust bottom to make space for xlabel
         
         # Original image
         plt.subplot(1, 3, 1)
         plt.imshow(results['original_image'])
         plt.title('Original Image')
+        # Add prompt under the original image
+        plt.xlabel(results.get('prompt', 'N/A'), fontsize=10, wrap=True)
         plt.axis('off')
         
-        # Importance map (heatmap)
+        # Importance map (original image with mask overlay)
         plt.subplot(1, 3, 2)
-        plt.imshow(results['importance_map'])
-        plt.title('Importance Map')
+        temp_image = results['original_image'].copy()
+        mask_indices = results['mask'] > 0  # Get indices where mask is active
+        temp_image[mask_indices] = temp_image[mask_indices] * 0.5 + np.array([255, 0, 0]) * 0.5 # Blend with red
+        plt.imshow(temp_image.astype(np.uint8))
+        plt.title('Importance Map Overlay')
         plt.axis('off')
         
         # Mask showing important regions
         plt.subplot(1, 3, 3)
         plt.imshow(results['mask'], cmap='hot')
         plt.title('Important Regions')
-        plt.axis('off')
         
         if save_path:
             plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
